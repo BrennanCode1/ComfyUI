@@ -103,61 +103,62 @@ def cuda_malloc_warning():
                 cuda_malloc_warning = True
         if cuda_malloc_warning:
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
+import gc
+import time
+import logging
 
 def prompt_worker(q, server):
     e = execution.PromptExecutor(server, lru_size=args.cache_lru)
-    last_gc_collect = 0
-    need_gc = False
-    gc_collect_interval = 10.0
+    gc.disable()  # Disable automatic garbage collection
+    request_counter = 0  # Initialize request counter
 
     while True:
+        current_time = time.perf_counter()
         timeout = 1000.0
-        if need_gc:
-            timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
+        # Get item from queue
         queue_item = q.get(timeout=timeout)
         if queue_item is not None:
             item, item_id = queue_item
-            execution_start_time = time.perf_counter()
             prompt_id = item[1]
             server.last_prompt_id = prompt_id
 
+            # Execute the prompt
+            logging.info(f"Starting execution for prompt {prompt_id}")
+            execution_start_time = time.perf_counter()
             e.execute(item[2], prompt_id, item[3], item[4])
-            need_gc = True
-            q.task_done(item_id,
-                        e.history_result,
-                        status=execution.PromptQueue.ExecutionStatus(
-                            status_str='success' if e.success else 'error',
-                            completed=e.success,
-                            messages=e.status_messages))
+            execution_end_time = time.perf_counter()
+            execution_time = execution_end_time - execution_start_time
+            logging.info(f"Prompt executed in {execution_time:.6f} seconds")
+
+            # Mark task as done
+            q.task_done(
+                item_id,
+                e.history_result,
+                status=execution.PromptQueue.ExecutionStatus(
+                    status_str='success' if e.success else 'error',
+                    completed=e.success,
+                    messages=e.status_messages
+                )
+            )
+
+            # Send sync message to client
             if server.client_id is not None:
-                server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, server.client_id)
+                server.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server.client_id)
 
-            current_time = time.perf_counter()
-            execution_time = current_time - execution_start_time
-            logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
+            # Increment request counter
+            request_counter += 1
 
-        flags = q.get_flags()
-        free_memory = flags.get("free_memory", False)
-
-        if flags.get("unload_models", free_memory):
-            comfy.model_management.unload_all_models()
-            need_gc = True
-            last_gc_collect = 0
-
-        if free_memory:
-            e.reset()
-            need_gc = True
-            last_gc_collect = 0
-
-        if need_gc:
-            current_time = time.perf_counter()
-            if (current_time - last_gc_collect) > gc_collect_interval:
-                comfy.model_management.cleanup_models()
+            # Trigger garbage collection every 100 requests
+            if request_counter >= 100:
+                logging.info("Triggering manual garbage collection")
+                gc_start_time = time.perf_counter()
                 gc.collect()
-                comfy.model_management.soft_empty_cache()
-                last_gc_collect = current_time
-                need_gc = False
+                gc_end_time = time.perf_counter()
+                gc_time = gc_end_time - gc_start_time
+                logging.info(f"Garbage collection completed in {gc_time:.6f} seconds")
+                request_counter = 0  # Reset counter
+
 
 async def run(server, address='', port=8188, verbose=True, call_on_start=None):
     await asyncio.gather(server.start(address, port, verbose, call_on_start), server.publish_loop())
